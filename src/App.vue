@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { Message } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
-import type { AlignmentRow, DifferenceStatus } from './types';
+import type { AlignmentRow, DifferenceStatus, DraftBatch, FieldConflict, MergeResult } from './types';
 
 const {
   versions,
@@ -21,6 +21,7 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  draftName,
   runAlignment,
   recalculate,
   updateRow,
@@ -30,6 +31,10 @@ const {
   acceptAll,
   nextDifference,
   addVersion,
+  parseDraftFile,
+  previewMerge,
+  applyMerge,
+  saveDraftName,
   undo,
   redo,
   exportMarkdown,
@@ -44,6 +49,13 @@ const noteDraft = ref('');
 const sourceDraft = ref('');
 const importForm = ref({ name: '', source: '', text: '' });
 const fileInput = ref<HTMLInputElement | null>(null);
+
+// 离线草稿合流
+const mergeVisible = ref(false);
+const mergeBatches = ref<DraftBatch[]>([]);
+const mergeResult = ref<MergeResult | null>(null);
+const resolutions = ref<Record<string, string | boolean>>({});
+const mergeFileInput = ref<HTMLInputElement | null>(null);
 
 const columns = [
   { title: '状态', dataIndex: 'status', slotName: 'status', width: 122, fixed: 'left' as const },
@@ -160,6 +172,82 @@ function handleFile(event: Event) {
   });
 }
 
+function openMerge() {
+  mergeBatches.value = [];
+  mergeResult.value = null;
+  resolutions.value = {};
+  mergeVisible.value = true;
+}
+
+function handleMergeFile(event: Event) {
+  const target = event.target as HTMLInputElement;
+  const files = target.files;
+  if (!files || !files.length) return;
+  Array.from(files).forEach((file) => {
+    file.text().then((text) => {
+      try {
+        const batch = parseDraftFile(text);
+        if (mergeBatches.value.some((item) => item.draftId === batch.draftId)) {
+          Message.warning(`草稿「${batch.draftName}」已添加，已跳过重复项`);
+          return;
+        }
+        mergeBatches.value.push(batch);
+        Message.success(`已添加草稿「${batch.draftName}」（${batch.rows.length} 行）`);
+      } catch {
+        Message.error(`草稿「${file.name}」解析失败，请确认是本工具导出的 JSON 文件`);
+      }
+    });
+  });
+  target.value = '';
+}
+
+function removeMergeBatch(draftId: string) {
+  mergeBatches.value = mergeBatches.value.filter((item) => item.draftId !== draftId);
+}
+
+function runMerge() {
+  if (!mergeBatches.value.length) {
+    Message.warning('请先添加至少一个离线草稿文件');
+    return;
+  }
+  saveDraftName(draftName.value.trim());
+  const result = previewMerge(mergeBatches.value);
+  mergeResult.value = result;
+  // 默认选中每方中最近保存的取值
+  const defaults: Record<string, string | boolean> = {};
+  result.conflicts.forEach((conflict) => {
+    const sorted = [...conflict.options].sort((a, b) => (a.savedAt < b.savedAt ? 1 : -1));
+    defaults[conflict.key] = sorted[0].value;
+  });
+  resolutions.value = defaults;
+  if (!result.conflicts.length) {
+    Message.success(`合流预览完成：共 ${result.stats.total} 行，${result.stats.merged} 行多方合并，${result.stats.invalidated} 条接受结论将失效重算。点击「确认写入」完成合流。`);
+  } else {
+    Message.info(`合流预览完成：${result.stats.conflictCount} 处冲突待确认，确认后写入`);
+  }
+}
+
+function confirmMerge() {
+  if (!mergeResult.value) return;
+  const unresolved = mergeResult.value.conflicts.filter((conflict) => resolutions.value[conflict.key] === undefined);
+  if (unresolved.length) {
+    Message.warning(`还有 ${unresolved.length} 处冲突未选择取值`);
+    return;
+  }
+  applyMerge(mergeResult.value, resolutions.value);
+  Message.success('离线草稿已合流写入');
+  mergeVisible.value = false;
+}
+
+function conflictOptions(conflict: FieldConflict) {
+  return [...conflict.options].sort((a, b) => (a.savedAt < b.savedAt ? 1 : -1));
+}
+
+function formatTime(iso: string) {
+  if (!iso || iso === new Date(0).toISOString()) return '时间未知';
+  return new Date(iso).toLocaleString('zh-CN');
+}
+
 function handleKeydown(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null;
   const typing = target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
@@ -207,6 +295,7 @@ window.addEventListener('beforeunload', beforeUnload);
           <a-button :disabled="!canRedo" @click="redo">重做</a-button>
           <a-button type="primary" :loading="processing" @click="runAlignment()">重新自动对齐</a-button>
           <a-button @click="openImport">导入版本</a-button>
+          <a-button @click="openMerge">合并离线草稿</a-button>
           <a-dropdown>
             <a-button>导出校勘记</a-button>
             <template #content>
@@ -488,5 +577,94 @@ window.addEventListener('beforeunload', beforeUnload);
       </a-form-item>
       <a-alert type="info" :show-icon="true">导入仅写入当前浏览器。对齐过程会分片执行，原文不会被自动改写。</a-alert>
     </a-form>
+  </a-modal>
+
+  <a-modal
+    v-model:visible="mergeVisible"
+    title="合并多台浏览器的离线草稿"
+    width="820px"
+    :ok-text="mergeResult ? '确认写入' : '开始合流'"
+    :cancel-text="mergeResult ? '返回修改' : '取消'"
+    :ok-button-props="{ disabled: mergeResult ? false : !mergeBatches.length }"
+    @ok="mergeResult ? confirmMerge() : runMerge()"
+    @cancel="mergeResult = null"
+  >
+    <a-alert type="info" :show-icon="true" style="margin-bottom: 14px">
+      各浏览器离线导出的 JSON 草稿在此合流：同一对底本句 / 参校本句的校记按字段直接并入，
+      同一字段或接受结论冲突时并排列出，确认后才写入。比较规则变化后，受影响的接受结论会失效重算。
+    </a-alert>
+
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px">
+      <span style="color: #4e5969; font-size: 13px; white-space: nowrap">本机草稿名称</span>
+      <a-input v-model="draftName" placeholder="如：张三的浏览器 / 整理组 A" style="max-width: 260px" @change="saveDraftName(draftName.trim())" />
+      <a-tag color="arcoblue">本机作为合流一方参与</a-tag>
+    </div>
+
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px">
+      <a-button @click="mergeFileInput?.click()">添加离线草稿文件</a-button>
+      <input ref="mergeFileInput" type="file" accept="application/json,.json" multiple style="display: none" @change="handleMergeFile" />
+      <span style="color: #86909c; font-size: 12px">可一次选择多个 JSON 草稿文件</span>
+    </div>
+
+    <div v-if="mergeBatches.length" style="border: 1px solid #e5e6eb; border-radius: 6px; margin-bottom: 12px">
+      <div
+        v-for="batch in mergeBatches"
+        :key="batch.draftId"
+        style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #f2f3f5"
+      >
+        <a-tag color="green">{{ batch.draftName }}</a-tag>
+        <span style="color: #4e5969; font-size: 13px">{{ batch.rows.length }} 行</span>
+        <span style="color: #86909c; font-size: 12px">{{ formatTime(batch.savedAt) }}</span>
+        <span style="color: #86909c; font-size: 12px">
+          规则：{{ batch.rules.ignorePunctuation ? '忽略标点' : '保留标点' }} ·
+          {{ batch.rules.ignoreVariants ? '忽略异体' : '保留异体' }}
+        </span>
+        <a-button size="mini" status="danger" style="margin-left: auto" @click="removeMergeBatch(batch.draftId)">移除</a-button>
+      </div>
+    </div>
+    <a-empty v-else description="尚未添加离线草稿文件" style="padding: 16px 0" />
+
+    <template v-if="mergeResult">
+      <a-divider style="margin: 12px 0">合流结果</a-divider>
+      <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px">
+        <a-tag color="arcoblue">共 {{ mergeResult.stats.total }} 行</a-tag>
+        <a-tag color="green">{{ mergeResult.stats.merged }} 行多方合并</a-tag>
+        <a-tag color="orange">{{ mergeResult.stats.invalidated }} 条接受结论失效重算</a-tag>
+        <a-tag v-if="mergeResult.stats.conflictCount" color="red">{{ mergeResult.stats.conflictCount }} 处冲突待确认</a-tag>
+      </div>
+
+      <div v-if="mergeResult.conflicts.length" style="display: grid; gap: 12px; max-height: 360px; overflow: auto">
+        <a-card v-for="conflict in mergeResult.conflicts" :key="conflict.key" :bordered="true" size="small">
+          <div style="margin-bottom: 8px">
+            <a-tag color="red">{{ conflict.fieldLabel }}冲突</a-tag>
+            <span style="color: #4e5969; font-size: 12px">
+              底本「{{ conflict.leftText || '（无）' }}」 · 参校本「{{ conflict.rightText || '（无）' }}」
+            </span>
+          </div>
+          <a-radio-group v-model="resolutions[conflict.key]" direction="vertical" style="width: 100%">
+            <a-radio
+              v-for="option in conflictOptions(conflict)"
+              :key="`${conflict.key}-${option.draftId}`"
+              :value="option.value"
+              style="display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border: 1px solid #f2f3f5; border-radius: 4px; margin-bottom: 6px"
+            >
+              <div style="display: flex; flex-direction: column; gap: 2px">
+                <div>
+                  <a-tag size="small" color="arcoblue">{{ option.draftName }}</a-tag>
+                  <span style="color: #86909c; font-size: 12px">{{ formatTime(option.savedAt) }}</span>
+                </div>
+                <div style="color: #1d2129; font-size: 13px; line-height: 1.6">
+                  <template v-if="conflict.field === 'accepted'">
+                    <a-tag :color="option.value ? 'green' : 'orange'">{{ option.value ? '已接受' : '待处理' }}</a-tag>
+                  </template>
+                  <template v-else>{{ option.value || '（空白）' }}</template>
+                </div>
+              </div>
+            </a-radio>
+          </a-radio-group>
+        </a-card>
+      </div>
+      <a-alert v-else type="success" :show-icon="true">各方校记与接受结论一致，无冲突，可直接写入。</a-alert>
+    </template>
   </a-modal>
 </template>

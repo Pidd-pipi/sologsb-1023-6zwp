@@ -1,84 +1,31 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { sampleVersions, splitIntoUnits } from '../data';
+import {
+  basisHash,
+  clone,
+  isQuotaError,
+  normalized,
+  rowKey,
+  similarity,
+  statusFor,
+  statusLabel,
+  yieldToBrowser
+} from '../collation';
+import { invalidateStale, mergeBatches } from '../merge';
 import type {
   AlignmentRow,
   ComparisonRules,
-  DifferenceStatus,
+  DraftBatch,
+  FieldConflict,
+  MergeResult,
   PersistedCollationState,
   TextUnit,
   VersionDocument
 } from '../types';
 
 const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
-
-const variantMap: Record<string, string> = {
-  為: '为',
-  爲: '为',
-  識: '识',
-  強: '强',
-  與: '与',
-  猶: '犹',
-  鄰: '邻',
-  儼: '俨',
-  渙: '涣',
-  將: '将',
-  樸: '朴',
-  曠: '旷',
-  濁: '浊',
-  靜: '静',
-  動: '动',
-  玅: '妙',
-  裏: '里',
-  裡: '里',
-  說: '说',
-  國: '国'
-};
-
-function clone<T>(value: T): T {
-  return structuredClone(value);
-}
-
-function yieldToBrowser() {
-  return new Promise<void>((resolve) => {
-    window.setTimeout(resolve, 0);
-  });
-}
-
-function normalized(value: string, rules: ComparisonRules) {
-  let result = value.toLocaleLowerCase().trim();
-  if (rules.ignoreVariants) {
-    result = Array.from(result, (character) => variantMap[character] ?? character).join('');
-  }
-  if (rules.ignorePunctuation) {
-    result = result.replace(/[\s，。！？；：、“”‘’「」『』（）()《》〈〉·,.!?;:'"[\]{}<>—\-…]/g, '');
-  }
-  return result;
-}
-
-function similarity(left: string, right: string) {
-  const a = Array.from(left);
-  const b = Array.from(right);
-  if (!a.length && !b.length) return 1;
-  if (!a.length || !b.length) return 0;
-  const previous = new Array(b.length + 1).fill(0);
-  for (let i = 1; i <= a.length; i += 1) {
-    let diagonal = 0;
-    for (let j = 1; j <= b.length; j += 1) {
-      const old = previous[j];
-      previous[j] = a[i - 1] === b[j - 1] ? diagonal + 1 : Math.max(previous[j], previous[j - 1]);
-      diagonal = old;
-    }
-  }
-  return previous[b.length] / Math.max(a.length, b.length);
-}
-
-function statusFor(left: TextUnit | undefined, right: TextUnit | undefined, ratio: number): DifferenceStatus {
-  if (!left) return 'added';
-  if (!right) return 'removed';
-  if (ratio > 0.995) return 'same';
-  if (ratio >= 0.38) return 'changed';
-  return 'misaligned';
-}
+const DRAFT_ID_KEY = 'sologsb-1023/multi-version-collation/draft-id';
+const DRAFT_NAME_KEY = 'sologsb-1023/multi-version-collation/draft-name';
 
 async function alignUnits(
   leftUnits: TextUnit[],
@@ -124,7 +71,8 @@ async function alignUnits(
           note: '',
           source: '',
           accepted: score > 0.995,
-          manuallyAdjusted: false
+          manuallyAdjusted: false,
+          basisHash: basisHash(left, right, rules)
         });
         leftIndex += 1;
         rightIndex += 1;
@@ -162,7 +110,8 @@ function makeRow(
     note: '',
     source,
     accepted: score > 0.995,
-    manuallyAdjusted: false
+    manuallyAdjusted: false,
+    basisHash: basisHash(left, right, rules)
   };
 }
 
@@ -192,6 +141,13 @@ export function useCollation() {
   const acceptedCount = computed(() => rows.value.filter((row) => row.accepted).length);
   const unresolvedCount = computed(() => rows.value.filter((row) => !row.accepted && row.status !== 'same').length);
 
+  // 每台浏览器一个稳定身份，用于离线草稿合流时标注来源
+  const draftId = ref(
+    localStorage.getItem(DRAFT_ID_KEY) || `draft-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  );
+  const draftName = ref(localStorage.getItem(DRAFT_NAME_KEY) || '');
+  if (!localStorage.getItem(DRAFT_ID_KEY)) localStorage.setItem(DRAFT_ID_KEY, draftId.value);
+
   function snapshot(): string {
     const data: PersistedCollationState = {
       versions: versions.value,
@@ -204,17 +160,18 @@ export function useCollation() {
     return JSON.stringify(data);
   }
 
-  function persist() {
-    localStorage.setItem(STORAGE_KEY, snapshot());
-  }
-
-  function commit(label: string, mutate: () => void) {
-    history.value.push(snapshot());
-    if (history.value.length > 50) history.value.shift();
-    future.value = [];
-    mutate();
-    message.value = label;
-    persist();
+  /** 写入本地存储；容量不足时拒绝覆盖并保留原草稿。 */
+  function persist(): boolean {
+    try {
+      localStorage.setItem(STORAGE_KEY, snapshot());
+      return true;
+    } catch (error) {
+      if (isQuotaError(error)) {
+        message.value = '本地存储空间不足，已保留原有完整草稿，未覆盖写入';
+        return false;
+      }
+      throw error;
+    }
   }
 
   function restore(raw: string) {
@@ -222,10 +179,33 @@ export function useCollation() {
     versions.value = parsed.versions;
     leftVersionId.value = parsed.leftVersionId;
     rightVersionId.value = parsed.rightVersionId;
-    rows.value = parsed.rows;
+    // 旧草稿可能缺少 basisHash，载入时按当前规则补算并失效过期接受结论
+    const { rows: restored } = invalidateStale(parsed.rows ?? [], parsed.rules ?? defaultRules());
+    rows.value = restored;
     rules.value = parsed.rules;
     selectedRowId.value = parsed.selectedRowId;
     persist();
+  }
+
+  function commit(label: string, mutate: () => void) {
+    const previous = snapshot();
+    history.value.push(previous);
+    if (history.value.length > 50) history.value.shift();
+    future.value = [];
+    mutate();
+    message.value = label;
+    if (!persist()) {
+      // 写入失败：回滚内存状态，保留存储中的完整旧草稿
+      const parsed = JSON.parse(previous) as PersistedCollationState;
+      versions.value = parsed.versions;
+      leftVersionId.value = parsed.leftVersionId;
+      rightVersionId.value = parsed.rightVersionId;
+      rows.value = parsed.rows;
+      rules.value = parsed.rules;
+      selectedRowId.value = parsed.selectedRowId;
+      history.value.pop();
+      future.value = [];
+    }
   }
 
   function undo() {
@@ -270,14 +250,10 @@ export function useCollation() {
 
   function recalculate() {
     commit('已按比较规则重算差异', () => {
-      rows.value = rows.value.map((row) => {
-        if (!row.left || !row.right) return row;
-        const score = Number(
-          similarity(normalized(row.left.text, rules.value), normalized(row.right.text, rules.value)).toFixed(3)
-        );
-        return { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
-      });
+      const { rows: next, invalidated } = invalidateStale(rows.value, rules.value);
+      rows.value = next;
       selectedRowIds.value = [];
+      if (invalidated) message.value = `比较规则已变化，${invalidated} 条接受结论已失效重算`;
     });
   }
 
@@ -309,6 +285,7 @@ export function useCollation() {
           row.similarity = 0;
         }
         row.manuallyAdjusted = true;
+        row.basisHash = basisHash(row.left, row.right, rules.value);
       }
     });
   }
@@ -376,6 +353,65 @@ export function useCollation() {
     void runAlignment();
   }
 
+  /** 当前浏览器草稿作为一个离线批次，供合流使用。 */
+  function currentBatch(): DraftBatch {
+    return {
+      draftId: draftId.value,
+      draftName: draftName.value.trim() || '当前浏览器',
+      savedAt: new Date().toISOString(),
+      rules: clone(rules.value),
+      rows: clone(rows.value)
+    };
+  }
+
+  /** 解析一个离线草稿文件（JSON）为批次。 */
+  function parseDraftFile(raw: string): DraftBatch {
+    const parsed = JSON.parse(raw) as Partial<DraftBatch> & { rows?: AlignmentRow[] };
+    if (!Array.isArray(parsed.rows)) throw new Error('草稿文件缺少 rows 字段');
+    return {
+      draftId: typeof parsed.draftId === 'string' ? parsed.draftId : `draft-${Date.now().toString(36)}`,
+      draftName: typeof parsed.draftName === 'string' ? parsed.draftName : '未命名草稿',
+      savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : new Date(0).toISOString(),
+      rules: parsed.rules ?? defaultRules(),
+      rows: parsed.rows
+    };
+  }
+
+  /**
+   * 合流多个离线草稿批次。
+   * 冲突项并排列出，由调用方在确认后通过 applyMerge 写入。
+   */
+  function previewMerge(batches: DraftBatch[]): MergeResult {
+    const all = [currentBatch(), ...batches];
+    return mergeBatches(rules.value, all);
+  }
+
+  /** 确认合并：写入合流结果与冲突取舍，进入撤销历史。 */
+  function applyMerge(result: MergeResult, resolutions: Record<string, string | boolean>) {
+    commit('已合流离线草稿', () => {
+      // 应用冲突取舍
+      result.conflicts.forEach((conflict) => {
+        const choice = resolutions[conflict.key];
+        if (choice === undefined) return;
+        const row = result.rows.find((item) => rowKey(item.left, item.right) === conflict.key);
+        if (!row) return;
+        if (conflict.field === 'accepted') {
+          row.accepted = Boolean(choice);
+        } else {
+          row[conflict.field] = String(choice);
+        }
+      });
+      rows.value = result.rows;
+      selectedRowId.value = result.rows.find((row) => row.status !== 'same')?.id ?? result.rows[0]?.id ?? '';
+      selectedRowIds.value = [];
+    });
+  }
+
+  function saveDraftName(name: string) {
+    draftName.value = name;
+    localStorage.setItem(DRAFT_NAME_KEY, name);
+  }
+
   function exportMarkdown() {
     const changed = rows.value.filter((row) => row.status !== 'same' || row.note || row.source);
     const lines = [
@@ -402,6 +438,9 @@ export function useCollation() {
   function exportJson() {
     return JSON.stringify(
       {
+        draftId: draftId.value,
+        draftName: draftName.value.trim() || '当前浏览器',
+        savedAt: new Date().toISOString(),
         left: leftVersion.value,
         right: rightVersion.value,
         rules: rules.value,
@@ -457,6 +496,8 @@ export function useCollation() {
     differenceCount,
     acceptedCount,
     unresolvedCount,
+    draftId,
+    draftName,
     runAlignment,
     recalculate,
     updateRow,
@@ -466,6 +507,11 @@ export function useCollation() {
     acceptAll,
     nextDifference,
     addVersion,
+    currentBatch,
+    parseDraftFile,
+    previewMerge,
+    applyMerge,
+    saveDraftName,
     undo,
     redo,
     exportMarkdown,
@@ -474,12 +520,4 @@ export function useCollation() {
   };
 }
 
-export function statusLabel(status: DifferenceStatus) {
-  return {
-    same: '相同',
-    changed: '改动',
-    added: '右侧新增',
-    removed: '左侧删减',
-    misaligned: '疑错位'
-  }[status];
-}
+export { statusLabel } from '../collation';
