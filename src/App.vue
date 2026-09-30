@@ -2,7 +2,9 @@
 import { computed, ref, watch } from 'vue';
 import { Message } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
-import type { AlignmentRow, DifferenceStatus } from './types';
+import MergeModal from './components/MergeModal.vue';
+import { invalidatedPairs } from './lib/merge';
+import type { AlignmentRow, DifferenceStatus, MergeSummary } from './types';
 
 const {
   versions,
@@ -21,6 +23,8 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  clientName,
+  lastPersistError,
   runAlignment,
   recalculate,
   updateRow,
@@ -32,18 +36,34 @@ const {
   addVersion,
   undo,
   redo,
+  renameClient,
   exportMarkdown,
   exportJson,
+  exportDraft,
+  previewMerge,
+  confirmMerge,
   commit
 } = useCollation();
 
 const importVisible = ref(false);
+const mergeVisible = ref(false);
+const mergeSummary = ref<MergeSummary | null>(null);
+const mergeFileInput = ref<HTMLInputElement | null>(null);
 const onlyDifferences = ref(false);
 const rowQuery = ref('');
 const noteDraft = ref('');
 const sourceDraft = ref('');
 const importForm = ref({ name: '', source: '', text: '' });
 const fileInput = ref<HTMLInputElement | null>(null);
+const clientNameDraft = ref(clientName.value);
+
+watch(clientName, (value) => {
+  clientNameDraft.value = value;
+});
+
+const mergeInvalidPairs = computed(() =>
+  mergeSummary.value ? invalidatedPairs(mergeSummary.value) : new Set<string>()
+);
 
 const columns = [
   { title: '状态', dataIndex: 'status', slotName: 'status', width: 122, fixed: 'left' as const },
@@ -117,15 +137,6 @@ function saveAnnotation() {
   Message.success('校勘说明已保存');
 }
 
-function download(filename: string, text: string, type: string) {
-  const url = URL.createObjectURL(new Blob([text], { type }));
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
-
 function handleExport(kind: 'markdown' | 'json') {
   if (kind === 'markdown') {
     download('校勘记.md', exportMarkdown(), 'text/markdown;charset=utf-8');
@@ -158,6 +169,70 @@ function handleFile(event: Event) {
       importForm.value.name = file.name.replace(/\.[^.]+$/, '');
     }
   });
+}
+
+function saveClientName() {
+  if (!clientNameDraft.value.trim()) {
+    Message.warning('请填写本机整理员名称');
+    return;
+  }
+  renameClient(clientNameDraft.value);
+  Message.success('整理员名称已保存');
+}
+
+function download(filename: string, text: string, type: string) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function handleExportDraft() {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  download(`校异斋-离线草稿-${clientName.value}-${stamp}.json`, exportDraft(), 'application/json;charset=utf-8');
+  Message.success('已导出完整离线校勘草稿，可交给其他整理员合流');
+}
+
+function openMergeFile() {
+  mergeFileInput.value?.click();
+}
+
+async function handleMergeFile(event: Event) {
+  const target = event.target as HTMLInputElement;
+  const file = target.files?.[0];
+  target.value = '';
+  if (!file) return;
+  try {
+    const raw = await file.text();
+    mergeSummary.value = previewMerge(raw);
+    mergeVisible.value = true;
+  } catch (error) {
+    Message.error(error instanceof Error ? error.message : '草稿解析失败');
+  }
+}
+
+function handleConfirmMerge(summary: MergeSummary) {
+  const result = confirmMerge(summary);
+  if (result.ok) {
+    mergeVisible.value = false;
+    mergeSummary.value = null;
+    Message.success(
+      `合流完成${result.invalidatedCount ? `，${result.invalidatedCount} 条接受记录已失效，请到表格中重新判断` : ''}`
+    );
+  } else {
+    // 容量不足：拒绝覆盖、现有草稿完整保留，把合并后的完整草稿交给用户下载
+    download(
+      `校异斋-合流失败完整草稿-${new Date().toISOString().slice(0, 10)}.json`,
+      result.raw,
+      'application/json;charset=utf-8'
+    );
+    Message.error({
+      content: `${result.error} 已自动下载合并后的完整草稿，请清理浏览器存储或改用导出文件，切勿覆盖本机草稿。`,
+      duration: 8000
+    });
+  }
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -207,6 +282,15 @@ window.addEventListener('beforeunload', beforeUnload);
           <a-button :disabled="!canRedo" @click="redo">重做</a-button>
           <a-button type="primary" :loading="processing" @click="runAlignment()">重新自动对齐</a-button>
           <a-button @click="openImport">导入版本</a-button>
+          <a-button status="warning" @click="handleExportDraft">导出离线草稿</a-button>
+          <a-button type="primary" status="success" @click="openMergeFile">合流草稿</a-button>
+          <input
+            ref="mergeFileInput"
+            type="file"
+            accept=".json,application/json"
+            style="display: none"
+            @change="handleMergeFile"
+          />
           <a-dropdown>
             <a-button>导出校勘记</a-button>
             <template #content>
@@ -236,6 +320,29 @@ window.addEventListener('beforeunload', beforeUnload);
           <a-progress v-if="processing" :percent="progress" size="small" style="margin-top: 12px" />
           <div v-if="processing" style="margin-top: 6px; color: #86909c; font-size: 12px">
             正在让出主线程，长文本编辑不会一直卡住
+          </div>
+        </section>
+
+        <section class="panel-section">
+          <h2 class="panel-title">本机整理员</h2>
+          <div style="display: flex; gap: 8px">
+            <a-input v-model="clientNameDraft" placeholder="整理员名称" allow-clear />
+            <a-button type="outline" @click="saveClientName">保存</a-button>
+          </div>
+          <div style="margin-top: 8px; color: #86909c; font-size: 12px; line-height: 1.6">
+            离线校勘时用该名称标记校记归属；合流冲突时按名称区分「本机」与「对方」。
+          </div>
+        </section>
+
+        <section class="panel-section">
+          <h2 class="panel-title">离线协作合流</h2>
+          <a-space direction="vertical" fill>
+            <a-button long status="warning" @click="handleExportDraft">导出本机完整草稿</a-button>
+            <a-button long type="primary" status="success" @click="openMergeFile">选择对方草稿合流</a-button>
+          </a-space>
+          <div style="margin-top: 10px; color: #86909c; font-size: 12px; line-height: 1.7">
+            网络恢复后，按「底本句 × 参校本句 × 比较规则」分批合流：不同字段直接并入；同一字段或接受结论冲突会并排待裁；
+            底本句、参校本句或规则变化后，受影响的接受记录自动失效重算；存储空间不足时拒绝覆盖并保留完整草稿。
           </div>
         </section>
 
@@ -288,6 +395,11 @@ window.addEventListener('beforeunload', beforeUnload);
       </a-layout-sider>
 
       <a-layout-content class="center-panel">
+        <a-alert v-if="lastPersistError" type="error" :show-icon="true" style="margin-bottom: 12px">
+          <template #title>本地存储空间不足，草稿未能写入</template>
+          {{ lastPersistError }}
+          <a-button type="text" size="small" @click="handleExportDraft">立即导出完整草稿</a-button>
+        </a-alert>
         <a-card :bordered="false" style="margin-bottom: 12px">
           <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
             <a-input-search v-model="rowQuery" placeholder="搜索正文、校记或来源" allow-clear style="max-width: 360px" />
@@ -489,4 +601,13 @@ window.addEventListener('beforeunload', beforeUnload);
       <a-alert type="info" :show-icon="true">导入仅写入当前浏览器。对齐过程会分片执行，原文不会被自动改写。</a-alert>
     </a-form>
   </a-modal>
+
+  <MergeModal
+    v-model:visible="mergeVisible"
+    :summary="mergeSummary"
+    :local-rules="rules"
+    :invalid-pairs="mergeInvalidPairs"
+    @confirm="handleConfirmMerge"
+    @export-local="handleExportDraft"
+  />
 </template>
